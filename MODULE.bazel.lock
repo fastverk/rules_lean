@@ -189,6 +189,24 @@
   },
   "selectedYankedVersions": {},
   "moduleExtensions": {
+    "//lean:lake.bzl%lake": {
+      "general": {
+        "bzlTransitiveDigest": "L6OpATJsrBf97L4r6+3GKGyKbA79Tm3meBBS6jb7DVo=",
+        "usagesDigest": "/hmef9abvgTAYgsrJT55Vr95gXcjADEhGPdKJLNJO48=",
+        "recordedInputs": [],
+        "generatedRepoSpecs": {
+          "lake_deps_smoke": {
+            "repoRuleId": "@@//lean:lake.bzl%lake_workspace",
+            "attributes": {
+              "lean_toolchain": "@@//examples/batteries_smoke:lean-toolchain",
+              "lakefile": "@@//examples/batteries_smoke:lakefile.lean",
+              "lake_manifest": "@@//examples/batteries_smoke:lake-manifest.json",
+              "allow_source_build": true
+            }
+          }
+        }
+      }
+    },
     "@@rules_kotlin+//src/main/starlark/core/repositories:bzlmod_setup.bzl%rules_kotlin_extensions": {
       "general": {
         "bzlTransitiveDigest": "Ga4z8lQy1YQ5rAMy+dOl0dqcCEBnYNCXku8x3YQmDZI=",

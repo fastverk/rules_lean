@@ -11,3 +11,24 @@ bazel_dep(name = "platforms", version = "0.0.10")
 bazel_dep(name = "bazel_skylib", version = "1.7.1", dev_dependency = True)
 bazel_dep(name = "rules_shell", version = "0.4.1", dev_dependency = True)
 bazel_dep(name = "stardoc", version = "0.7.2", dev_dependency = True)
+
+# Dev-only end-to-end smoke: materializes a Batteries-only Lake workspace,
+# source-builds the oleans (no mathlib Reservoir cache), and runs a
+# lean_test against `@lake_deps_smoke//:batteries`. Exercised by
+# `bazel test //examples/...` and the lake_integration CI job. The
+# `lake_workspace` rule itself is consumer-facing — this block only
+# stages the integration test for this repo's own CI.
+lake = use_extension("//lean:lake.bzl", "lake", dev_dependency = True)
+lake.workspace(
+    name = "lake_deps_smoke",
+    allow_source_build = True,
+    lake_manifest = "//examples/batteries_smoke:lake-manifest.json",
+    lakefile = "//examples/batteries_smoke:lakefile.lean",
+    lean_toolchain = "//examples/batteries_smoke:lean-toolchain",
+)
+use_repo(lake, "lake_deps_smoke")
+
+register_toolchains(
+    "@lake_deps_smoke//:lean_toolchain_def",
+    dev_dependency = True,
+)

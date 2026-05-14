@@ -39,15 +39,17 @@ jobs:
           chmod +x /usr/local/bin/buildifier
       - run: buildifier --mode=check --lint=warn -r .
 
-  # Slow integration: actually runs `lake_workspace`, downloading the Lean
-  # toolchain and pulling mathlib oleans from Reservoir. Runs on-tag and
-  # weekly to catch upstream breakage in Lake / mathlib's cache server.
-  # Not a PR gate — too slow + flaky on network.
+  # End-to-end smoke: actually runs `lake_workspace` against a Batteries-only
+  # Lake workspace (no Mathlib → no multi-GB Reservoir cache download), then
+  # typechecks a Lean file that imports Batteries. This exercises the full
+  # chain: Lean toolchain download → lake update → lake build batteries →
+  # lean_prebuilt_library → lean_test. Push-only (not a PR gate) because
+  # building Batteries from source is ~1-2 min cold.
   lake_integration:
-    name: lake_workspace end-to-end
+    name: lake_workspace end-to-end (batteries)
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: bazel-contrib/setup-bazel@0.10.0
@@ -55,12 +57,4 @@ jobs:
           bazelisk-cache: true
           disk-cache: ${{ github.workflow }}-lake
           repository-cache: true
-      - name: cache lake mathlib oleans
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/mathlib
-          key: mathlib-${{ hashFiles('examples/**/lake-manifest.json') }}
-      - run: |
-          # Placeholder until examples/mathlib_smoke is wired in this repo.
-          # For now this job verifies the lake_workspace extension loads.
-          bazel mod graph >/dev/null
+      - run: bazel test //examples/batteries_smoke:smoke_test --test_output=errors
