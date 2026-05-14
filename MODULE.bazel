@@ -1,14 +1,17 @@
 module(
     name = "rules_lean",
-    version = "0.2.1",
+    version = "0.2.2",
     compatibility_level = 1,
 )
 
 bazel_dep(name = "platforms", version = "0.0.10")
 
-# Dev-only: needed for documentation generation + diff_tests; not pulled in
-# by consumers of `@rules_lean//lean:lean.bzl` or `@rules_lean//lean:lake.bzl`.
-bazel_dep(name = "bazel_skylib", version = "1.7.1", dev_dependency = True)
+# bazel_skylib is loaded at file scope by lean/BUILD.bazel and
+# lean/private/BUILD.bazel (`bzl_library` for stardoc), so it has to be
+# resolvable when consumers load `@rules_lean//lean`. Can't be dev-only.
+bazel_dep(name = "bazel_skylib", version = "1.7.1")
+
+# Dev-only: only loaded by docs/BUILD.bazel, which consumers never analyze.
 bazel_dep(name = "rules_shell", version = "0.4.1", dev_dependency = True)
 bazel_dep(name = "stardoc", version = "0.7.2", dev_dependency = True)
 
