@@ -1,8 +1,13 @@
 module(
     name = "rules_lean",
-    version = "0.1.0",
+    version = "0.2.0",
     compatibility_level = 1,
 )
 
-bazel_dep(name = "bazel_skylib", version = "1.7.1")
 bazel_dep(name = "platforms", version = "0.0.10")
+
+# Dev-only: needed for documentation generation + diff_tests; not pulled in
+# by consumers of `@rules_lean//lean:lean.bzl` or `@rules_lean//lean:lake.bzl`.
+bazel_dep(name = "bazel_skylib", version = "1.7.1", dev_dependency = True)
+bazel_dep(name = "rules_shell", version = "0.4.1", dev_dependency = True)
+bazel_dep(name = "stardoc", version = "0.7.2", dev_dependency = True)

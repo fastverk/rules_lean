@@ -1,3 +1,10 @@
+load("@bazel_skylib//:bzl_library.bzl", "bzl_library")
+
 package(default_visibility = ["//lean:__pkg__"])
 
 exports_files(["known_lean_versions.bzl"])
+
+bzl_library(
+    name = "known_lean_versions_bzl",
+    srcs = ["known_lean_versions.bzl"],
+)

@@ -1,14 +1,24 @@
 """Lake integration for rules_lean.
 
-`lake_workspace` is a repository rule that materializes a Lake workspace
+`lake_workspace` is a repository rule that materializes any Lake workspace
 (lakefile + lake-manifest.json) into a Bazel-managed external repo,
-downloads the matching Lean toolchain, runs `lake exe cache get` to pull
-prebuilt mathlib oleans from upstream Reservoir, and exposes:
+downloads the matching Lean toolchain, resolves Lake packages, and exposes
+each resolved package as its own `lean_prebuilt_library` target.
 
-  - `@<name>//:lean_toolchain` — register via `register_toolchains(...)`.
-  - `@<name>//:Mathlib`        — consolidated `lean_prebuilt_library`
-                                 containing oleans for every Lake package
-                                 in the resolved workspace.
+Generated targets in `@<name>//:`:
+
+  - `:lean_toolchain` / `:lean_toolchain_def` — register via
+    `register_toolchains(...)`.
+  - `:<package>` — one `lean_prebuilt_library` per Lake package found under
+    `.lake/packages/<package>/`. Target names preserve Lake's directory
+    casing (e.g. `:mathlib`, `:batteries`, `:Cli`, `:LeanSearchClient`).
+    Consumers depend on multiple packages by listing all needed names.
+
+Fast path for mathlib-based workspaces: if `.lake/packages/mathlib/` is
+present after `lake update`, the rule runs `lake exe cache get` to pull
+prebuilt oleans from the Reservoir cache (covering mathlib + its transitive
+deps). For non-mathlib packages and workspaces, `lake build` produces
+oleans from source.
 
 Use via the module extension:
 
@@ -20,15 +30,24 @@ Use via the module extension:
         lake_manifest = "//:lake-manifest.json",
     )
     use_repo(lake, "lake_deps")
-    register_toolchains("@lake_deps//:lean_toolchain")
+    register_toolchains("@lake_deps//:lean_toolchain_def")
+
+    # In a BUILD.bazel:
+    lean_test(
+        name = "smoke",
+        srcs = ["Smoke.lean"],
+        entry = "Smoke.lean",
+        deps = ["@lake_deps//:mathlib", "@lake_deps//:batteries"],
+    )
 
 Hermeticity:
   - The Lean toolchain is downloaded with a known sha256 (see
     private/known_lean_versions.bzl) when the version is pinned there.
     Unpinned versions download unverified (warning emitted).
   - Lake dep revs are pinned by the user's committed lake-manifest.json.
-  - Mathlib oleans are content-addressed by mathlib's commit hash in the
-    upstream Reservoir cache; integrity is verified by Lake.
+  - Mathlib oleans (when applicable) are content-addressed by mathlib's
+    commit hash in the upstream Reservoir cache; integrity is verified by
+    Lake.
 
 Constraints on the lakefile passed in:
   - Should be a *deps-only* lakefile (the rule creates a placeholder
@@ -127,65 +146,67 @@ def _list_lake_packages(rctx):
         return []
     return [line for line in result.stdout.strip().split("\n") if line]
 
-def _consolidate_oleans(rctx, packages):
-    """Merge .lake/packages/*/.lake/build/lib/lean/ into lib/. Returns True if non-empty."""
-    rctx.execute(["rm", "-rf", "lib"])
-    rctx.execute(["mkdir", "-p", "lib"])
-    any_merged = False
+def _write_package_markers(rctx, packages):
+    """Drop a `.marker` file at each package's olean root for lean_prebuilt_library.
+
+    Returns the list of (package_name, lib_dir) that actually have oleans.
+    """
+    ready = []
     for pkg in packages:
-        src = rctx.path("lake_ws/.lake/packages/{pkg}/.lake/build/lib/lean".format(pkg = pkg))
-        if not src.exists:
+        lib = "lake_ws/.lake/packages/{pkg}/.lake/build/lib/lean".format(pkg = pkg)
+        if not rctx.path(lib).exists:
             continue
-        result = rctx.execute(["cp", "-RLn", str(src) + "/.", "lib/"])
-        if result.return_code == 0:
-            any_merged = True
-        else:
-            # buildifier: disable=print
-            print("rules_lean: WARNING — failed to merge oleans from %s: %s" % (pkg, result.stderr))
-    rctx.file("lib/.marker", "")
-    return any_merged
+        rctx.file("{lib}/.marker".format(lib = lib), "")
+        ready.append((pkg, lib))
+    return ready
 
-def _generate_build_file(rctx, packages_found):
-    rctx.file("BUILD.bazel", """\
-load("@rules_lean//lean:lean.bzl", "lean_prebuilt_library", "lean_toolchain")
-
-package(default_visibility = ["//visibility:public"])
-
-filegroup(
-    name = "lean_bin",
-    srcs = ["lean_toolchain/bin/lean"],
-)
-
-filegroup(
-    name = "runtime",
-    srcs = glob(
-        [
-            "lean_toolchain/bin/**",
-            "lean_toolchain/lib/**",
-            "lean_toolchain/include/**",
-        ],
-        allow_empty = True,
-    ),
-)
-
-lean_toolchain(
-    name = "lean_toolchain",
-    lean = ":lean_bin",
-    runtime = ":runtime",
-)
-
-toolchain(
-    name = "lean_toolchain_def",
-    toolchain = ":lean_toolchain",
-    toolchain_type = "@rules_lean//lean:toolchain_type",
-)
-
-lean_prebuilt_library(
-    name = "Mathlib",
-    srcs = glob(["lib/**"], allow_empty = True),
-    path_marker = "lib/.marker",
-)
-""")
+def _generate_build_file(rctx, packages):
+    """Emit a BUILD.bazel exposing the toolchain + one prebuilt_library per package."""
+    lines = [
+        'load("@rules_lean//lean:lean.bzl", "lean_prebuilt_library", "lean_toolchain")',
+        "",
+        'package(default_visibility = ["//visibility:public"])',
+        "",
+        'filegroup(',
+        '    name = "lean_bin",',
+        '    srcs = ["lean_toolchain/bin/lean"],',
+        ')',
+        "",
+        'filegroup(',
+        '    name = "runtime",',
+        '    srcs = glob(',
+        '        [',
+        '            "lean_toolchain/bin/**",',
+        '            "lean_toolchain/lib/**",',
+        '            "lean_toolchain/include/**",',
+        '        ],',
+        '        allow_empty = True,',
+        '    ),',
+        ')',
+        "",
+        'lean_toolchain(',
+        '    name = "lean_toolchain",',
+        '    lean = ":lean_bin",',
+        '    runtime = ":runtime",',
+        ')',
+        "",
+        'toolchain(',
+        '    name = "lean_toolchain_def",',
+        '    toolchain = ":lean_toolchain",',
+        '    toolchain_type = "@rules_lean//lean:toolchain_type",',
+        ')',
+        "",
+    ]
+    for pkg, lib in packages:
+        lines += [
+            'lean_prebuilt_library(',
+            '    name = "{name}",'.format(name = pkg),
+            '    srcs = glob(["{lib}/**"], allow_empty = True),'.format(lib = lib),
+            '    path_marker = "{lib}/.marker",'.format(lib = lib),
+            ')',
+            "",
+        ]
+    rctx.file("BUILD.bazel", "\n".join(lines))
 
 def _lake_workspace_impl(rctx):
     platform = _detect_platform(rctx)
@@ -197,35 +218,50 @@ def _lake_workspace_impl(rctx):
 
     env = _lake_env(rctx)
 
-    # Resolve deps. Lake creates lake-manifest.json if absent, or respects
-    # the existing one if revs match. Materializes .lake/packages/<pkg>/.
+    # Resolve deps. Lake respects the existing lake-manifest.json if revs match
+    # the lakefile; otherwise it updates the manifest. Materializes
+    # .lake/packages/<pkg>/ as side effect.
     update = _run_lake(rctx, ["update"], timeout = 1200, env = env)
     if update.return_code != 0:
         fail("rules_lean: `lake update` failed.\nstdout:\n%s\nstderr:\n%s" %
              (update.stdout, update.stderr))
-
-    # Try the fast path: download prebuilt mathlib oleans from Reservoir.
-    cache = _run_lake(rctx, ["exe", "cache", "get"], timeout = 3600, env = env)
-    if cache.return_code != 0:
-        if rctx.attr.allow_source_build:
-            # buildifier: disable=print
-            print("rules_lean: `lake exe cache get` failed — falling back to `lake build Mathlib`.")
-            build = _run_lake(rctx, ["build", "Mathlib"], timeout = 7200, env = env)
-            if build.return_code != 0:
-                fail("rules_lean: `lake build Mathlib` failed.\nstdout:\n%s\nstderr:\n%s" %
-                     (build.stdout, build.stderr))
-        else:
-            fail("rules_lean: `lake exe cache get` failed (cache miss or no mathlib in deps).\n" +
-                 "Set `allow_source_build = True` to fall back to `lake build` (slow).\n" +
-                 "stdout:\n%s\nstderr:\n%s" % (cache.stdout, cache.stderr))
 
     packages = _list_lake_packages(rctx)
     if not packages:
         fail("rules_lean: no packages found under lake_ws/.lake/packages/ after lake update. " +
              "Is the lakefile missing `require` directives?")
 
-    _consolidate_oleans(rctx, packages)
-    _generate_build_file(rctx, packages)
+    # Fast path: if mathlib is in the dep graph, run its `cache get` exe to pull
+    # prebuilt oleans for mathlib + its transitive deps from the Reservoir
+    # cache. For non-mathlib workspaces, this command does not exist, so skip.
+    if "mathlib" in packages:
+        cache = _run_lake(rctx, ["exe", "cache", "get"], timeout = 3600, env = env)
+        if cache.return_code != 0 and not rctx.attr.allow_source_build:
+            fail("rules_lean: `lake exe cache get` failed (cache miss for this " +
+                 "mathlib rev?).\nSet `allow_source_build = True` to fall back " +
+                 "to `lake build` (slow).\nstdout:\n%s\nstderr:\n%s" %
+                 (cache.stdout, cache.stderr))
+
+    # For any package whose oleans aren't yet on disk (no mathlib cache hit, or
+    # non-mathlib workspace), source-build via `lake build <pkg>`. Skipped
+    # unless allow_source_build (slow); otherwise the missing-oleans state will
+    # surface as a clear error when lean_test/lean_emit can't find imports.
+    if rctx.attr.allow_source_build:
+        for pkg in packages:
+            lib = "lake_ws/.lake/packages/{p}/.lake/build/lib/lean".format(p = pkg)
+            if rctx.path(lib).exists:
+                continue
+            build = _run_lake(rctx, ["build", pkg], timeout = 7200, env = env)
+            if build.return_code != 0:
+                fail("rules_lean: `lake build %s` failed.\nstdout:\n%s\nstderr:\n%s" %
+                     (pkg, build.stdout, build.stderr))
+
+    ready = _write_package_markers(rctx, packages)
+    if not ready:
+        fail("rules_lean: no package oleans found under " +
+             "lake_ws/.lake/packages/*/.lake/build/lib/lean/. " +
+             "Cache get may have failed silently; consider allow_source_build = True.")
+    _generate_build_file(rctx, ready)
 
 lake_workspace = repository_rule(
     implementation = _lake_workspace_impl,
@@ -247,11 +283,15 @@ lake_workspace = repository_rule(
         ),
         "allow_source_build": attr.bool(
             default = False,
-            doc = "If True, fall back to `lake build Mathlib` (~30 min) when `lake exe cache get` fails.",
+            doc = "If True, run `lake build <pkg>` for every package whose oleans " +
+                  "aren't covered by `lake exe cache get`. Slow for large packages " +
+                  "(mathlib from source is ~30 min); fast and necessary for custom " +
+                  "Lake deps that have no upstream cache.",
         ),
     },
     doc = "Materializes a Lake workspace as a Bazel external repo. " +
-          "Produces `:lean_toolchain` + `:Mathlib` targets.",
+          "Produces `:lean_toolchain_def` + one `lean_prebuilt_library` " +
+          "per resolved Lake package (target name = Lake's directory name).",
 )
 
 def _lake_extension_impl(mctx):
