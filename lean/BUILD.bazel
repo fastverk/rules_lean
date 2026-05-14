@@ -1,0 +1,10 @@
+load(":lean.bzl", "lean_toolchain")
+
+package(default_visibility = ["//visibility:public"])
+
+toolchain_type(name = "toolchain_type")
+
+exports_files([
+    "lean.bzl",
+    "lake.bzl",
+])
