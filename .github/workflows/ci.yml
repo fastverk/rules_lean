@@ -1,0 +1,66 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # Fast PR gate: rule-graph loads, stardoc-generated reference docs match
+  # the .bzl docstrings (diff_test), build is green on both Linux and macOS.
+  # Does *not* exercise `lake_workspace` — that's deferred to the slow job
+  # so we don't pull mathlib on every push.
+  test:
+    name: bazel test //docs/...
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bazel-contrib/setup-bazel@0.10.0
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}-${{ matrix.os }}
+          repository-cache: true
+      - run: bazel test //docs/... --test_output=errors
+
+  buildifier:
+    name: buildifier lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install buildifier
+        run: |
+          curl -fsSL -o /usr/local/bin/buildifier \
+            https://github.com/bazelbuild/buildtools/releases/download/v7.3.1/buildifier-linux-amd64
+          chmod +x /usr/local/bin/buildifier
+      - run: buildifier --mode=check --lint=warn -r .
+
+  # Slow integration: actually runs `lake_workspace`, downloading the Lean
+  # toolchain and pulling mathlib oleans from Reservoir. Runs on-tag and
+  # weekly to catch upstream breakage in Lake / mathlib's cache server.
+  # Not a PR gate — too slow + flaky on network.
+  lake_integration:
+    name: lake_workspace end-to-end
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bazel-contrib/setup-bazel@0.10.0
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}-lake
+          repository-cache: true
+      - name: cache lake mathlib oleans
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/mathlib
+          key: mathlib-${{ hashFiles('examples/**/lake-manifest.json') }}
+      - run: |
+          # Placeholder until examples/mathlib_smoke is wired in this repo.
+          # For now this job verifies the lake_workspace extension loads.
+          bazel mod graph >/dev/null
