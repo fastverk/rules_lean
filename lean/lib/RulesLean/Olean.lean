@@ -10,18 +10,24 @@ elaboration time.
 
 ## What's exposed
 
-* `imports` — the modules a given `.olean` directly imports.
-* `transitiveImports` — closed under a caller-supplied
-  `(moduleName → path)` resolver.
+* `imports` / `importModuleNames` — modules this `.olean` imports.
+* `transitiveImports` — closed under a caller-supplied resolver.
+* `exportedConstants` — every declaration the module defines (its
+  symbol table). Includes definitions, theorems, axioms, structures,
+  inductives — anything that lands in `constNames`.
+* `containsAxiom` — predicate: does the module's symbol table
+  contain a constant with the given name? Cheap version of
+  axiom-dependency tracking when the caller only needs to ask "does
+  this module bring in axiom X?".
 
 ## What's deferred to follow-up versions
 
-* Exported constants (the symbol table). Requires reading the
-  full module body, not just the header.
-* Axiom-dependency graph (which axioms each constant transitively
-  depends on). Same.
-* Content hash of the module data. Already used internally by Lean's
-  incremental machinery; will expose as a clean accessor.
+* True axiom-dependency closure (which axioms each constant
+  transitively depends on across the imported module graph).
+  Requires walking `ConstantInfo` records and resolving axiom
+  references — bigger surface than `containsAxiom` checks.
+* Content hash of the module data. No stable accessor in stock Lean
+  4.29.1; would need to compute over the file bytes if exposed.
 -/
 
 namespace RulesLean.Olean
@@ -84,6 +90,35 @@ unsafe def transitiveImports
         if !visited.contains imp then
           worklist := worklist.push imp
   return visited.toArray
+
+/--
+Every constant the module declares (its symbol table). Includes
+definitions, theorems, axioms, structures, inductives — anything
+in `ModuleData.constNames`.
+
+Compiler-generated auxiliary declarations (`extraConstNames`) are
+*not* included; those are inlined by Lean's codegen and rarely
+matter at the spec/proof level.
+-/
+unsafe def exportedConstants (path : System.FilePath) : IO (Array Name) := do
+  let (modData, _) ← readModuleData path
+  return modData.constNames
+
+/--
+Does the module's symbol table contain a constant by this name?
+
+Quick way to ask "does this olean bring in axiom X?" without
+materializing the whole constants list — useful for spot-checks
+("does any module import `Classical.choice`?", "which oleans
+declare `sorryAx`?").
+
+Returns `true` for any matching constant, regardless of whether
+it's an axiom, theorem, definition, etc. Caller is responsible for
+knowing what kind of name they're looking for.
+-/
+unsafe def containsConstant (path : System.FilePath) (name : Name) : IO Bool := do
+  let consts ← exportedConstants path
+  return consts.contains name
 
 /--
 Initialise Lean's search path against the toolchain sysroot.

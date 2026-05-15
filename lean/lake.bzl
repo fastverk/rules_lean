@@ -207,6 +207,22 @@ def _generate_build_file(rctx, packages):
             ")",
             "",
         ]
+
+    # Exposes the module-level imports manifest produced by RulesLean's
+    # oleanImports CLI. Consumed by downstream tooling that wants to ask
+    # "what does .olean X import?" without parsing oleans themselves.
+    # See //lean/lib/RulesLean/Olean.lean for the library API.
+    lines += [
+        "filegroup(",
+        '    name = "lake_imports_manifest",',
+        '    srcs = ["lake_imports_manifest.tsv"],',
+        ")",
+        "",
+        "exports_files([",
+        '    "lake_imports_manifest.tsv",',
+        "])",
+        "",
+    ]
     rctx.file("BUILD.bazel", "\n".join(lines))
 
 def _lake_workspace_impl(rctx):
@@ -262,7 +278,92 @@ def _lake_workspace_impl(rctx):
         fail("rules_lean: no package oleans found under " +
              "lake_ws/.lake/packages/*/.lake/build/lib/lean/. " +
              "Cache get may have failed silently; consider allow_source_build = True.")
+
+    _build_ruleslean_library(rctx, env)
+    _generate_imports_manifest(rctx, ready, env)
     _generate_build_file(rctx, ready)
+
+def _build_ruleslean_library(rctx, env):
+    """Stage the RulesLean library source and build it with the consumer's Lean toolchain.
+
+    The library at @rules_lean//lean/lib/ ships its own lakefile and Lake project.
+    We stage it into `ruleslean_lib/` (a sibling of `lake_ws/`) and invoke
+    `lake build oleanImports` to compile both the library and the CLI executable.
+
+    Cost: ~3-5s cold per lake_workspace materialization. The cached `.lake/build/`
+    persists across builds.
+    """
+    # The library lives at @rules_lean//lean/lib/. We need the whole directory;
+    # rctx.path() on the lakefile gives us a starting point, then copy the tree.
+    lakefile_path = rctx.path(Label("@rules_lean//lean/lib:lakefile.lean"))
+    src_dir = str(lakefile_path.dirname)
+
+    cp = rctx.execute(["cp", "-RL", src_dir, "ruleslean_lib"])
+    if cp.return_code != 0:
+        fail("rules_lean: failed to stage RulesLean library source from %s: %s" %
+             (src_dir, cp.stderr))
+
+    lake_bin = str(rctx.path("lean_toolchain/bin/lake"))
+    result = rctx.execute(
+        [lake_bin, "build", "oleanImports"],
+        working_directory = "ruleslean_lib",
+        environment = env,
+        timeout = 600,
+        quiet = False,
+    )
+    if result.return_code != 0:
+        fail(("rules_lean: building the RulesLean library / oleanImports CLI " +
+              "failed.\nstdout:\n%s\nstderr:\n%s") %
+             (result.stdout, result.stderr))
+
+def _generate_imports_manifest(rctx, ready, env):
+    """Run oleanImports over every package's olean tree and write the manifest.
+
+    For each (`package`, olean root) pair, enumerate every `.olean` file and
+    pipe the path list through the freshly-built `oleanImports` binary. The
+    resulting `<path>\\t<imported-module>` lines aggregate into
+    `lake_imports_manifest.tsv` at the @lake_deps repo root, exposed via the
+    generated BUILD.
+    """
+    olean_paths = []
+    for _, lib in ready:
+        result = rctx.execute(
+            ["sh", "-c", "find {lib} -name '*.olean' -type f".format(lib = lib)],
+        )
+        if result.return_code != 0:
+            continue
+        for line in result.stdout.strip().split("\n"):
+            if line:
+                olean_paths.append(line)
+
+    if not olean_paths:
+        rctx.file("lake_imports_manifest.tsv", "")
+        return
+
+    rctx.file("olean_paths.txt", "\n".join(olean_paths) + "\n")
+
+    cli_bin = "ruleslean_lib/.lake/build/bin/oleanImports"
+    if not rctx.path(cli_bin).exists:
+        # buildifier: disable=print
+        print("rules_lean: WARNING — oleanImports binary not at %s; manifest empty" % cli_bin)
+        rctx.file("lake_imports_manifest.tsv", "")
+        return
+
+    # Pipe paths through the CLI. stderr is collected but per-file errors
+    # don't fail the rule — a single bad olean shouldn't block analysis.
+    result = rctx.execute(
+        ["sh", "-c", "'%s' < olean_paths.txt" % str(rctx.path(cli_bin))],
+        environment = env,
+        timeout = 600,
+    )
+    if result.return_code != 0:
+        # buildifier: disable=print
+        print("rules_lean: WARNING — oleanImports CLI exited %d; manifest empty.\nstderr:\n%s" %
+              (result.return_code, result.stderr))
+        rctx.file("lake_imports_manifest.tsv", "")
+        return
+
+    rctx.file("lake_imports_manifest.tsv", result.stdout)
 
 lake_workspace = repository_rule(
     implementation = _lake_workspace_impl,

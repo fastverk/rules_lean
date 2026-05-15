@@ -1,5 +1,5 @@
 import RulesLean.Olean
-import RulesLean.Lake
+import RulesLean.Workspace
 
 /-!
 # RulesLean — umbrella import.
