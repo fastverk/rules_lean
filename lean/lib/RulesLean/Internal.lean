@@ -1,3 +1,4 @@
+import RulesLean.Internal.AxiomDeps
 import RulesLean.Internal.Filesystem
 
 /-!
@@ -25,4 +26,8 @@ internal-to-internal renames.
 * `Internal.Filesystem` — directory-walking + olean-tree helpers
   used by the workspace-introspection code. Internal because the
   set of helpers we expose changes as `Workspace`'s needs evolve.
+* `Internal.AxiomDeps` — axiom-dependency tools. Currently exposes
+  `declaredAxioms` (modules' own axiom declarations) and `isAxiom`
+  (presence check). The deeper "transitive axiom closure across
+  the import graph" lands here once a consumer pushes on the shape.
 -/
