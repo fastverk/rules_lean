@@ -30,3 +30,7 @@ lean_lib RulesLean where
 lean_exe oleanImports where
   root := `RulesLean.Cli.OleanImports
   supportInterpreter := true
+
+lean_exe leanClosure where
+  root := `RulesLean.Cli.LeanClosure
+  supportInterpreter := true

@@ -1,4 +1,5 @@
 import RulesLean.Internal.AxiomDeps
+import RulesLean.Internal.Closure
 import RulesLean.Internal.Filesystem
 
 /-!
