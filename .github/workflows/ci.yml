@@ -74,9 +74,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lean_version: ["4.29.1"]
-        # Add upcoming versions here once they're released:
-        #   "4.30.0", "4.31.0", etc.
+        lean_version: ["4.29.1", "4.30.0-rc2"]
+        # v4.30.0-rc2 matches the cslib pin; we want compat in case
+        # downstream consumers depend on both rules_lean and cslib.
     steps:
       - uses: actions/checkout@v4
       - name: install elan

@@ -21,7 +21,7 @@ common --registry=https://bcr.bazel.build/
 In your `MODULE.bazel`:
 
 ```python
-bazel_dep(name = "rules_lean", version = "0.3.0-rc1")
+bazel_dep(name = "rules_lean", version = "0.3.0")
 
 lake = use_extension("@rules_lean//lean:lake.bzl", "lake")
 lake.workspace(
