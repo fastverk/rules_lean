@@ -13,3 +13,5 @@ reservoir-manifest.json
 __pycache__/
 .ipynb_checkpoints/
 notebooks/interesting_packages.csv
+.claude/
+MODULE.bazel.lock
