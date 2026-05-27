@@ -275,12 +275,35 @@ def _lean_emit_impl(ctx):
         fail("entry %r not found among srcs (got %s)" %
              (ctx.attr.entry, [r for (_, r) in rel_paths]))
 
+    # `data` files: staged alongside srcs in the work dir but NOT
+    # compiled. Lets the entry script open them at runtime via a
+    # package-relative path (the action runs from $WORK). Used e.g.
+    # for `.dat` / `.txt` fixture inputs.
+    data_paths = []
+    for d in ctx.files.data:
+        rel = _module_path(d.short_path, pkg)
+        data_paths.append((d, rel))
+
     dep_markers, dep_files = _collect_dep_lean_info(ctx.attr.deps)
     dep_lean_path_dirs = [m.path[:m.path.rfind("/")] for m in dep_markers.to_list()]
 
-    cmd_lines = ["set -euo pipefail", "WORK=$(mktemp -d)", "trap 'rm -rf \"$WORK\"' EXIT"]
+    cmd_lines = [
+        "set -euo pipefail",
+        "WORK=$(mktemp -d)",
+        "trap 'rm -rf \"$WORK\"' EXIT",
+        # Resolve `lean` to an absolute path BEFORE any cd. The compile
+        # / --run commands use this so the `cd "$WORK"` step below
+        # doesn't break the toolchain lookup.
+        'LEAN_BIN="$(pwd)/{lean}"'.format(lean = tc.lean.path),
+        # Same for the output target.
+        'OUT_ABS="$(pwd)/{out}"'.format(out = output.path),
+    ]
 
     for src, rel in rel_paths:
+        cmd_lines.append('mkdir -p "$WORK/$(dirname {rel})"'.format(rel = rel))
+        cmd_lines.append('cp "{src}" "$WORK/{rel}"'.format(src = src.path, rel = rel))
+
+    for src, rel in data_paths:
         cmd_lines.append('mkdir -p "$WORK/$(dirname {rel})"'.format(rel = rel))
         cmd_lines.append('cp "{src}" "$WORK/{rel}"'.format(src = src.path, rel = rel))
 
@@ -292,17 +315,23 @@ def _lean_emit_impl(ctx):
     for _, rel in rel_paths:
         olean = rel.removesuffix(".lean") + ".olean"
         cmd_lines.append(
-            '"{lean}" --root="$WORK" -o "$WORK/{olean}" "$WORK/{rel}"'
-                .format(lean = tc.lean.path, olean = olean, rel = rel),
+            '"$LEAN_BIN" --root="$WORK" -o "$WORK/{olean}" "$WORK/{rel}"'
+                .format(olean = olean, rel = rel),
         )
 
+    # Run from $WORK so the entry script's relative file-opens
+    # resolve to the staged `data` files.
     cmd_lines.append(
-        '"{lean}" --root="$WORK" --run "$WORK/{entry}" > "{out}"'
-            .format(lean = tc.lean.path, entry = entry_rel, out = output.path),
+        '(cd "$WORK" && "$LEAN_BIN" --root="$WORK" --run "{entry}") > "$OUT_ABS"'
+            .format(entry = entry_rel),
     )
 
     inputs = depset(
-        direct = [src for (src, _) in rel_paths] + [tc.lean],
+        direct = (
+            [src for (src, _) in rel_paths] +
+            [src for (src, _) in data_paths] +
+            [tc.lean]
+        ),
         transitive = [tc.runtime, dep_files],
     )
 
@@ -332,6 +361,10 @@ lean_emit = rule(
             doc = "The emitted artifact (one file). Filename should reflect the artifact kind.",
         ),
         "deps": attr.label_list(providers = [LeanInfo]),
+        "data": attr.label_list(
+            allow_files = True,
+            doc = "Non-Lean files staged alongside `srcs` in the action's work directory (NOT compiled). The Lean entry runs from that directory, so it can `IO.FS.readFile` them by their package-relative path. Typical use: fixture `.dat` / `.txt` / `.json` inputs the entry processes.",
+        ),
     },
     toolchains = ["@rules_lean//lean:toolchain_type"],
 )
@@ -364,7 +397,7 @@ lean_emit = rule(
 # `bazel test //path:regen_int_arith` fails with the diff if the Lean
 # emit and `expected` disagree.
 # =============================================================================
-def lean_regen_test(name, srcs, entry, expected, out = None, deps = None, tags = None):
+def lean_regen_test(name, srcs, entry, expected, out = None, deps = None, data = None, tags = None):
     """Assert a committed file matches the current `lean_emit` output.
 
     Args:
@@ -396,6 +429,7 @@ def lean_regen_test(name, srcs, entry, expected, out = None, deps = None, tags =
         entry = entry,
         out = out,
         deps = deps if deps else [],
+        data = data if data else [],
     )
 
     _diff_test(

@@ -12,3 +12,16 @@ lean_regen_test(
     entry = "Hello.lean",
     expected = "expected.txt",
 )
+
+# Smoke for the `data` attr (v0.3.3). EchoFixture.lean does
+# `IO.FS.readFile "fixture.txt"` and echoes the content; lean_regen_test
+# diff_tests the captured stdout against the same `fixture.txt`.
+# Passing proves the data file is staged in the action's work dir
+# and reachable via package-relative path from the Lean entry.
+lean_regen_test(
+    name = "regen_smoke_data",
+    srcs = ["EchoFixture.lean"],
+    entry = "EchoFixture.lean",
+    data = ["fixture.txt"],
+    expected = "fixture.txt",
+)

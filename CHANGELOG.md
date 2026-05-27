@@ -4,6 +4,21 @@ All notable changes to rules_lean. The format is loosely
 [Keep a Changelog](https://keepachangelog.com/) — version headers
 mirror the published bazel-registry entries.
 
+## 0.3.3 — `lean_emit.data` attr
+
+- `lean_emit` (and `lean_regen_test`) gain a `data` attr — non-Lean
+  fixture files staged alongside `srcs` in the action's work directory
+  without being compiled. The entry runs from that work dir, so it
+  can `IO.FS.readFile` them by their package-relative path. Typical
+  use: `.dat` / `.txt` / `.json` inputs the entry parses. Enabled
+  rules_postgres' Lean-native `Pg.Catalog.Dat` round-trip gate
+  against the vendored `pg_namespace.dat` sample.
+- New smoke `examples/regen_smoke/regen_smoke_data` exercises the
+  attr end-to-end: a Lean main reads `fixture.txt` and echoes it;
+  the diff_test verifies the captured stdout matches the same
+  `fixture.txt` (proving the data file is reachable from the Lean
+  entry's relative-path `readFile`).
+
 ## 0.3.2 — `lean_regen_test` macro
 
 - New `lean_regen_test(name, srcs, entry, expected, ...)` macro in

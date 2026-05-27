@@ -192,7 +192,7 @@
     "//lean:lake.bzl%lake": {
       "general": {
         "bzlTransitiveDigest": "agu9POW0H17WqI1+iN6wtCdKTciIjxzQ2gdPgL5xuTY=",
-        "usagesDigest": "jMxSgyR+j/XE6VWBhDurReAP1A4/4rOserq9VGgWhl0=",
+        "usagesDigest": "O4ZZaDhCcGx9hcOh5fSYJm2Az2iHHaJO8bnDTQNBv7Q=",
         "recordedInputs": [],
         "generatedRepoSpecs": {
           "lake_deps_smoke": {
