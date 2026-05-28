@@ -245,8 +245,15 @@ def _lake_workspace_impl(rctx):
 
     packages = _list_lake_packages(rctx)
     if not packages:
-        fail("rules_lean: no packages found under lake_ws/.lake/packages/ after lake update. " +
-             "Is the lakefile missing `require` directives?")
+        # Dep-free workspace: the lakefile declares no `require`s because the
+        # project's Lean sources import only Lean 4 core (no mathlib/batteries).
+        # That's valid — there's nothing to fetch or source-build. Emit just the
+        # toolchain (+ an empty imports manifest / dep BUILD) and return. The
+        # registered `:lean_toolchain_def` is all a dep-free consumer needs.
+        _build_ruleslean_library(rctx, env)
+        _generate_imports_manifest(rctx, [], env)
+        _generate_build_file(rctx, [])
+        return
 
     # Fast path: if mathlib is in the dep graph, run its `cache get` exe to pull
     # prebuilt oleans for mathlib + its transitive deps from the Reservoir
