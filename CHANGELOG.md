@@ -4,6 +4,28 @@ All notable changes to rules_lean. The format is loosely
 [Keep a Changelog](https://keepachangelog.com/) — version headers
 mirror the published bazel-registry entries.
 
+## 0.3.9 — import-topological compile order (`glob()`-safe srcs)
+
+- `lean_test`, `lean_emit`, and `lean_main_test` now compile their
+  `srcs` in **import-topological order** instead of literal list
+  order. Previously, Lean's requirement that a module's imports be
+  compiled to `.olean` first meant `srcs` had to be hand-ordered
+  with dependencies before dependents — and a natural
+  `glob(["**/*.lean"])` would fail, because a root file like
+  `Trading.lean` sorts before `Trading/Fx/Basic.lean` (`.` < `/`)
+  yet imports it. Now the generated runner derives the order at
+  execution time: it parses each staged file's `import` lines,
+  keeps edges to modules that are themselves in `srcs`, and
+  `tsort`s the graph. **`srcs = glob([...])` now Just Works**;
+  explicit ordered lists keep working unchanged (any valid manual
+  order is already a valid topological order).
+- Implementation: a portable bash helper (`__lean_topo_compile`,
+  shared via `_topo_compile_block`) using only
+  `grep`/`sed`/`cut`/`tsort`/`mktemp` — no bash-4 associative
+  arrays, so it runs on macOS's stock bash 3.2. Out-of-`srcs`
+  imports (Mathlib, dep packages) are ignored; genuine import
+  cycles still fail the build (Lean rejects them downstream).
+
 ## 0.3.5 — `lean_main_test` rule
 
 - New `lean_main_test(name, srcs, entry, deps, data)` rule in

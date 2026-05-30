@@ -133,6 +133,60 @@ def _module_path(src_short_path, file_package):
         fail("source %s is not inside its package %s" % (src_short_path, file_package))
     return src_short_path[len(file_package) + 1:]
 
+# Bash helper (POSIX / bash 3.2 compatible — macOS ships bash 3.2, so no
+# associative arrays) that compiles a set of staged `.lean` files in
+# *dependency order* regardless of the order `srcs` was listed in. Lean needs a
+# module's imports already compiled to `.olean` before it, but the analysis
+# phase can't read file contents to sort — so we derive the order at execution
+# time: parse each file's `import` lines, keep only edges to modules that are
+# themselves in the set, and `tsort` the result. This makes `glob()` work in
+# `srcs` and removes the "order matters" footgun. Relies only on
+# grep/sed/cut/tsort/mktemp, consistent with the rest of these generated scripts.
+#
+# Reads `$LEAN_BIN`; takes ROOT dir, a log prefix, then the rel paths as args.
+_TOPO_COMPILE_FN = r'''__lean_topo_compile() {
+  local ROOT="$1"; local PFX="$2"; shift 2
+  local RELS=("$@")
+  local TD; TD=$(mktemp -d)
+  local MODS="$TD/mods" EDGES="$TD/edges" MAP="$TD/map"
+  : > "$MODS"; : > "$EDGES"; : > "$MAP"
+  local rel mod imp imports olean order
+  for rel in "${RELS[@]}"; do
+    mod=$(printf '%s' "$rel" | sed -E 's/\.lean$//; s#/#.#g')
+    printf '%s\n' "$mod" >> "$MODS"
+    printf '%s\t%s\n' "$mod" "$rel" >> "$MAP"
+  done
+  for rel in "${RELS[@]}"; do
+    mod=$(printf '%s' "$rel" | sed -E 's/\.lean$//; s#/#.#g')
+    # Edge from a sentinel so isolated nodes (no in-set imports) still appear.
+    printf '@@leanroot@@ %s\n' "$mod" >> "$EDGES"
+    imports=$(grep -E '^import[[:space:]]' "$ROOT/$rel" 2>/dev/null | sed -E 's/^import[[:space:]]+([A-Za-z0-9_.]+).*/\1/' || true)
+    for imp in $imports; do
+      if grep -qxF "$imp" "$MODS"; then printf '%s %s\n' "$imp" "$mod" >> "$EDGES"; fi
+    done
+  done
+  order=$(tsort "$EDGES") || { echo "ERROR: import cycle among Lean srcs ($PFX)" >&2; rm -rf "$TD"; exit 3; }
+  for mod in $order; do
+    [ "$mod" = "@@leanroot@@" ] && continue
+    rel=$(grep -F "$(printf '%s\t' "$mod")" "$MAP" | head -1 | cut -f2-)
+    olean="${rel%.lean}.olean"
+    echo "[$PFX] lean --root=$ROOT -o $olean $rel" >&2
+    "$LEAN_BIN" --root="$ROOT" -o "$ROOT/$olean" "$ROOT/$rel"
+  done
+  rm -rf "$TD"
+}'''
+
+def _topo_compile_block(root_expr, log_prefix, rels):
+    """Function definition + an invocation compiling `rels` under `root_expr` in
+    import-topological order. `rels` are package-relative `.lean` paths."""
+    args = " ".join(['"{}"'.format(r) for r in rels])
+    return '{fn}\n__lean_topo_compile "{root}" "{pfx}" {args}'.format(
+        fn = _TOPO_COMPILE_FN,
+        root = root_expr,
+        pfx = log_prefix,
+        args = args,
+    )
+
 def _lean_test_impl(ctx):
     tc = ctx.toolchains["@rules_lean//lean:toolchain_type"].leantc
     name = ctx.label.name
@@ -166,14 +220,9 @@ def _lean_test_impl(ctx):
     dep_markers, dep_files = _collect_dep_lean_info(ctx.attr.deps)
     dep_marker_short_paths = [m.short_path for m in dep_markers.to_list()]
 
-    compile_lines = "\n".join([
-        ('  echo "[lean_test] lean --root=$LEAN_ROOT -o {olean} {src}" >&2\n' +
-         '  "$LEAN_BIN" --root="$LEAN_ROOT" -o "$LEAN_ROOT/{olean}" "$LEAN_ROOT/{src}"').format(
-            src = rel,
-            olean = rel.removesuffix(".lean") + ".olean",
-        )
-        for rel in rel_paths
-    ])
+    # Compile in import-topological order (so `srcs` may be a `glob()`), not
+    # input-list order.
+    compile_lines = _topo_compile_block("$LEAN_ROOT", "lean_test", rel_paths)
 
     dep_lean_path_lines = "\n".join([
         ('dep_sp="{sp}"; ' +
@@ -252,7 +301,7 @@ lean_test = rule(
         "srcs": attr.label_list(
             allow_files = [".lean"],
             mandatory = True,
-            doc = "All .lean files in the proof tree. Module path is derived from the file's path relative to this BUILD.bazel's package.",
+            doc = "All .lean files in the proof tree. Module path is derived from the file's path relative to this BUILD.bazel's package. Compiled in import-topological order, so list order is irrelevant — `glob([\"**/*.lean\"])` is fine.",
         ),
         "entry": attr.string(
             mandatory = True,
@@ -339,12 +388,8 @@ def _lean_emit_impl(ctx):
         'export LEAN_PATH="{}${{LEAN_PATH:+:$LEAN_PATH}}"'.format(":".join(lean_path_parts)),
     )
 
-    for _, rel in rel_paths:
-        olean = rel.removesuffix(".lean") + ".olean"
-        cmd_lines.append(
-            '"$LEAN_BIN" --root="$WORK" -o "$WORK/{olean}" "$WORK/{rel}"'
-                .format(olean = olean, rel = rel),
-        )
+    # Compile in import-topological order (so `srcs` may be a `glob()`).
+    cmd_lines.append(_topo_compile_block("$WORK", "lean_emit", [rel for (_, rel) in rel_paths]))
 
     # Run from $WORK so the entry script's relative file-opens
     # resolve to the staged `data` files.
@@ -431,9 +476,9 @@ def lean_regen_test(name, srcs, entry, expected, out = None, deps = None, data =
       name: target name for the generated diff_test (e.g.
         `regen_int_arith`). The helper `lean_emit` is named
         `<name>_emit`.
-      srcs: ordered list of `.lean` source labels needed to compile
-        the entry. Order matters — `lean_emit` compiles them
-        sequentially. Must include the entry.
+      srcs: list of `.lean` source labels needed to compile the
+        entry. Compiled in import-topological order, so list order
+        is irrelevant (a `glob()` is fine). Must include the entry.
       entry: path of the entry-point `.lean` file (relative to the
         rule's package) defining `main : IO Unit`. Stdout is captured.
       expected: Bazel label of the committed file the lean_emit
@@ -543,13 +588,9 @@ def _lean_main_test_impl(ctx):
     lean_path_parts = ["$WORK"] + dep_lean_path_dirs
     lines.append('export LEAN_PATH="{}"'.format(":".join(lean_path_parts)))
 
-    # Compile + run from $WORK; exit code propagates.
-    for _, rel in rel_paths:
-        olean = rel.removesuffix(".lean") + ".olean"
-        lines.append(
-            '"$LEAN_BIN" --root="$WORK" -o "$WORK/{olean}" "$WORK/{rel}"'
-                .format(olean = olean, rel = rel),
-        )
+    # Compile in import-topological order (so `srcs` may be a `glob()`), then
+    # run from $WORK; exit code propagates.
+    lines.append(_topo_compile_block("$WORK", "lean_main_test", [rel for (_, rel) in rel_paths]))
     lines.append('cd "$WORK" && exec "$LEAN_BIN" --root="$WORK" --run "{entry}"'.format(entry = entry_rel))
 
     ctx.actions.write(output = runner, content = "\n".join(lines) + "\n", is_executable = True)
@@ -573,7 +614,7 @@ lean_main_test = rule(
         "srcs": attr.label_list(
             allow_files = [".lean"],
             mandatory = True,
-            doc = "All .lean files needed to compile the entry. Order matters.",
+            doc = "All .lean files needed to compile the entry. Compiled in import-topological order, so list order is irrelevant (a `glob()` is fine).",
         ),
         "entry": attr.string(
             mandatory = True,
