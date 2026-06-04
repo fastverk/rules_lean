@@ -1,6 +1,6 @@
 """Bazel rules for Lean 4.
 
-Four user-facing rules:
+User-facing rules:
   lean_toolchain         — registers a Lean compiler binary + runtime tree.
                            Normally produced by `lake_workspace` (see lake.bzl);
                            can also be declared by hand against a hermetic
@@ -9,6 +9,16 @@ Four user-facing rules:
                            LeanInfo provider consumable via the `deps` attr.
                            The `path_marker` file's parent directory becomes
                            the LEAN_PATH entry.
+  lean_library           — compile a set of .lean sources to a persistent
+                           .olean import-root tree (build outputs) and expose
+                           it as LeanInfo. Lets one module be a *compiled*
+                           dep of another (no source re-sharing). Transitive:
+                           its LeanInfo carries its deps' closure too.
+  lean_olean_archive     — bundle a lean_library's own .olean tree into a
+                           tarball — the deployable cross-repo release artifact.
+  lean_imported_library  — expose an unpacked .olean tarball (e.g. from an
+                           `http_archive` of a release asset) as LeanInfo,
+                           with NO recompile. The cross-repo consume side.
   lean_test              — stages a set of .lean sources into a module-path
                            layout and invokes the compiler on an entry point.
                            Returns 0 if all type-check, nonzero otherwise.
@@ -20,10 +30,14 @@ Four user-facing rules:
                            the source of truth for emitted artifacts (SQL,
                            TTL, Markdown). Same `deps` plumbing as lean_test.
 
-Design choice: one bundled lean_test per package rather than a per-file
-lean_library + transitive .olean tracking. Lean already does fast
-incremental type-checking; the value of fine-grained Bazel actions is not
-worth the staging-tree complexity at small-to-medium scale.
+`lean_library`/`lean_olean_archive`/`lean_imported_library` (added 0.4.0) are
+the cross-repo compiled-artifact seam: split a monolithic Lean library into
+modules, publish each module's `.olean` tree as a per-`(lean-version, os, arch)`
+release tarball, and have downstreams consume the prebuilt oleans without
+recompiling. `.olean` is neither Lean-version- nor architecture-portable (it is
+a compacted heap image), so a consumer must pin the SAME `lean-toolchain` and
+`select()` the matching-platform artifact; Lean itself rejects a mismatched
+olean loudly at use.
 """
 
 # Used by `lean_regen_test` (see bottom of this file) — kept up here
@@ -383,7 +397,7 @@ def _lean_emit_impl(ctx):
         cmd_lines.append('mkdir -p "$WORK/$(dirname {rel})"'.format(rel = rel))
         cmd_lines.append('cp "{src}" "$WORK/{rel}"'.format(src = src.path, rel = rel))
 
-    lean_path_parts = ["$WORK"] + ['$EXEC_ROOT/' + d for d in dep_lean_path_dirs]
+    lean_path_parts = ["$WORK"] + ["$EXEC_ROOT/" + d for d in dep_lean_path_dirs]
     cmd_lines.append(
         'export LEAN_PATH="{}${{LEAN_PATH:+:$LEAN_PATH}}"'.format(":".join(lean_path_parts)),
     )
@@ -565,7 +579,7 @@ def _lean_main_test_impl(ctx):
         'for cand in "$RUNFILES_DIR"/_main "$RUNFILES_DIR"/*; do',
         '  if [[ -x "$cand/{lean}" ]]; then LEAN_BIN="$cand/{lean}"; break; fi'
             .format(lean = tc.lean.short_path),
-        'done',
+        "done",
         '[[ -n "${LEAN_BIN:-}" ]] || { echo "lean binary not found in runfiles" >&2; exit 2; }',
     ]
 
@@ -627,4 +641,165 @@ lean_main_test = rule(
         ),
     },
     toolchains = ["@rules_lean//lean:toolchain_type"],
+)
+
+# =============================================================================
+# lean_library: compile .lean sources to a persistent .olean import-root tree
+# (build outputs) and expose it as LeanInfo, so one module can be a *compiled*
+# dependency of another. DefaultInfo carries only THIS library's own tree (the
+# unit a `lean_olean_archive` packages); LeanInfo carries the transitive
+# closure (own + deps) so downstream consumers list only direct deps.
+# =============================================================================
+
+_MARKER_NAME = ".lean_root"
+
+def _lean_library_impl(ctx):
+    tc = ctx.toolchains["@rules_lean//lean:toolchain_type"].leantc
+    name = ctx.label.name
+    root_dir = name + "_lib"
+
+    rel_paths = []  # (src File, package-relative .lean path)
+    olean_outs = []  # (olean-rel path, declared File)
+    for src in ctx.files.srcs:
+        rel = _module_path(src.short_path, src.owner.package)
+        if not rel.endswith(".lean"):
+            fail("lean_library srcs must be .lean files; got %s" % rel)
+        rel_paths.append((src, rel))
+        olean_rel = rel[:-len(".lean")] + ".olean"
+        olean_outs.append((olean_rel, ctx.actions.declare_file("{}/{}".format(root_dir, olean_rel))))
+
+    marker = ctx.actions.declare_file("{}/{}".format(root_dir, _MARKER_NAME))
+
+    dep_markers, dep_files = _collect_dep_lean_info(ctx.attr.deps)
+    dep_lean_path_dirs = [m.path[:m.path.rfind("/")] for m in dep_markers.to_list()]
+
+    cmd = [
+        "set -euo pipefail",
+        "WORK=$(mktemp -d)",
+        "trap 'rm -rf \"$WORK\"' EXIT",
+        # Absolutize before any cd so the toolchain + dep roots resolve.
+        'LEAN_BIN="$(pwd)/{lean}"'.format(lean = tc.lean.path),
+        'EXEC_ROOT="$(pwd)"',
+        "export LEAN_BIN",
+    ]
+    for src, rel in rel_paths:
+        cmd.append('mkdir -p "$WORK/$(dirname {rel})"'.format(rel = rel))
+        cmd.append('cp "{src}" "$WORK/{rel}"'.format(src = src.path, rel = rel))
+
+    lean_path_parts = ["$WORK"] + ["$EXEC_ROOT/" + d for d in dep_lean_path_dirs]
+    cmd.append('export LEAN_PATH="{}${{LEAN_PATH:+:$LEAN_PATH}}"'.format(":".join(lean_path_parts)))
+
+    # Compile in import-topological order (so `srcs` may be a `glob()`).
+    cmd.append(_topo_compile_block("$WORK", "lean_library", [rel for (_, rel) in rel_paths]))
+
+    # Copy the produced oleans to their declared outputs + write the marker.
+    for olean_rel, out in olean_outs:
+        cmd.append('cp "$WORK/{orel}" "{out}"'.format(orel = olean_rel, out = out.path))
+    cmd.append('printf "rules_lean lean_library\\n" > "{marker}"'.format(marker = marker.path))
+
+    own_files = [o for (_, o) in olean_outs] + [marker]
+    ctx.actions.run_shell(
+        outputs = own_files,
+        inputs = depset(
+            direct = [src for (src, _) in rel_paths] + [tc.lean],
+            transitive = [tc.runtime, dep_files],
+        ),
+        command = "\n".join(cmd),
+        mnemonic = "LeanCompile",
+        progress_message = "Lean library %s" % name,
+    )
+
+    return [
+        DefaultInfo(files = depset(own_files)),
+        LeanInfo(
+            markers = depset([marker], transitive = [dep_markers]),
+            files = depset(own_files, transitive = [dep_files]),
+        ),
+    ]
+
+lean_library = rule(
+    implementation = _lean_library_impl,
+    attrs = {
+        "srcs": attr.label_list(
+            allow_files = [".lean"],
+            mandatory = True,
+            doc = "All .lean files in this library. Module path is derived from the file's path relative to its own package. Compiled in import-topological order, so list order is irrelevant (a `glob()` is fine).",
+        ),
+        "deps": attr.label_list(
+            providers = [LeanInfo],
+            doc = "Compiled Lean libraries this one imports. Their import roots are on LEAN_PATH during compilation and propagate transitively in this library's LeanInfo.",
+        ),
+    },
+    toolchains = ["@rules_lean//lean:toolchain_type"],
+    doc = "Compile .lean sources to a persistent .olean import-root tree and expose it as LeanInfo.",
+)
+
+# =============================================================================
+# lean_olean_archive: tar a lean_library's OWN .olean import-root tree into a
+# deployable artifact. The tarball unpacks to an import root (`Foo/Bar.olean`,
+# `.lean_root` at top) consumable by `lean_imported_library`. One archive per
+# `(lean-version, os, arch)` — build it on each target platform (oleans are not
+# cross-compilable); the release/upload step names the asset per-platform.
+# =============================================================================
+
+def _lean_olean_archive_impl(ctx):
+    own_files = ctx.attr.library[DefaultInfo].files.to_list()
+    marker = None
+    for f in own_files:
+        if f.basename == _MARKER_NAME:
+            marker = f
+    if marker == None:
+        fail("library %s has no %s marker; is it a lean_library?" % (ctx.attr.library.label, _MARKER_NAME))
+    root = marker.dirname
+
+    out = ctx.actions.declare_file(ctx.attr.out if ctx.attr.out else (ctx.label.name + ".tar.gz"))
+
+    # `tar -C <root> .` packs the import-root contents at the tarball top.
+    # Portable across GNU and bsd tar (macOS); entries are gzip-compressed.
+    ctx.actions.run_shell(
+        outputs = [out],
+        inputs = depset(own_files),
+        command = 'tar -czf "{out}" -C "{root}" .'.format(out = out.path, root = root),
+        mnemonic = "LeanOleanArchive",
+        progress_message = "Lean olean archive %s" % ctx.label.name,
+    )
+    return [DefaultInfo(files = depset([out]))]
+
+lean_olean_archive = rule(
+    implementation = _lean_olean_archive_impl,
+    attrs = {
+        "library": attr.label(
+            providers = [LeanInfo],
+            mandatory = True,
+            doc = "The `lean_library` whose own .olean tree is archived.",
+        ),
+        "out": attr.string(doc = "Output tarball name (default `<name>.tar.gz`)."),
+    },
+    doc = "Bundle a lean_library's .olean import-root tree into a deployable tarball.",
+)
+
+# =============================================================================
+# lean_imported_library: expose an unpacked .olean tarball (e.g. extracted by
+# an `http_archive` of a release asset) as LeanInfo, with NO recompile. This is
+# the cross-repo consume side of lean_olean_archive. Identical mechanics to
+# lean_prebuilt_library; named + documented for the import-from-release case.
+# The consumer must pin the SAME lean-toolchain version and `select()` the
+# matching-platform archive — Lean rejects a mismatched olean loudly at use.
+# =============================================================================
+
+lean_imported_library = rule(
+    implementation = _lean_prebuilt_library_impl,
+    attrs = {
+        "srcs": attr.label_list(
+            allow_files = True,
+            mandatory = True,
+            doc = "All files of the unpacked .olean tree (typically `@<archive_repo>//:all` or a `glob`).",
+        ),
+        "path_marker": attr.label(
+            allow_single_file = True,
+            mandatory = True,
+            doc = "Anchor file inside the unpacked import root (the archive's `.lean_root`). Its parent dir becomes the LEAN_PATH entry.",
+        ),
+    },
+    doc = "Expose an unpacked .olean release tarball as LeanInfo (no recompile).",
 )
