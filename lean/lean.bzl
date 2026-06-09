@@ -628,6 +628,109 @@ lean_library = rule(
 )
 
 # =============================================================================
+# lean_binary: a runnable Lean executable. Compiles all srcs to an .olean
+# import root (like lean_library), then emits a runner that `lean --run`s the
+# entry against that root, forwarding command-line args to the program's
+# `main (args : List String)`. Unlike lean_emit (build-time, fixed stdout) /
+# lean_main_test (build-time test), this runs at runtime with real argv — so a
+# Lean lowering can be a real CLI tool (e.g. a codec deparse reading a file).
+# =============================================================================
+
+def _lean_binary_impl(ctx):
+    tc = ctx.toolchains["@rules_lean//lean:toolchain_type"].leantc
+    name = ctx.label.name
+    root_dir = name + "_bin"
+
+    entry_rel = None
+    entry_src = None
+    units = []  # (src, rel, olean)
+    consumer_tops = {}
+    for src in ctx.files.srcs:
+        rel = _module_path(src.short_path, src.owner.package)
+        if not rel.endswith(".lean"):
+            fail("lean_binary srcs must be .lean files; got %s" % rel)
+        consumer_tops[rel.split("/")[0]] = True
+        olean = ctx.actions.declare_file("{}/{}".format(root_dir, rel[:-len(".lean")] + ".olean"))
+        units.append((src, rel, olean))
+        if rel == ctx.attr.entry:
+            entry_rel = rel
+            entry_src = src
+    if entry_rel == None:
+        fail("entry %r not found among srcs" % ctx.attr.entry)
+
+    dep_markers, dep_files = _collect_dep_lean_info(ctx.attr.deps)
+    dep_marker_dirs = [m.path[:m.path.rfind("/")] for m in dep_markers.to_list()]
+
+    marker = ctx.actions.declare_file("{}/{}".format(root_dir, _MARKER_NAME))
+    lines = [
+        "lean\t" + tc.lean.path,
+        "work\t" + name + ".topo_work",
+        "marker\t" + marker.path,
+    ]
+    for src, rel, olean in units:
+        lines.append("stage\t" + src.path + "\t" + rel)
+        lines.append("module\t" + rel)
+        lines.append("output\t" + rel + "\t" + olean.path)
+    lines += _dep_manifest_lines(dep_files, dep_marker_dirs, consumer_tops)
+
+    manifest = ctx.actions.declare_file(name + ".topo_manifest")
+    ctx.actions.write(output = manifest, content = "\n".join(lines) + "\n")
+    own_oleans = [olean for (_, _, olean) in units]
+    ctx.actions.run(
+        executable = tc.lean,
+        arguments = ["--run", ctx.file._driver.path, manifest.path],
+        outputs = own_oleans + [marker],
+        inputs = depset(
+            direct = [ctx.file._driver, manifest, tc.lean] + [s for (s, _, _) in units],
+            transitive = [tc.runtime, dep_files],
+        ),
+        mnemonic = "LeanBinary",
+        progress_message = "Lean binary %s" % name,
+    )
+
+    # Runner: `lean --run <entry-source> "$@"` with LEAN_PATH = the olean root.
+    lean_rf = tc.lean.short_path
+    if lean_rf.startswith("../"):
+        lean_rf = lean_rf[len("../"):]
+    pkg = ctx.label.package
+    root_rf = (pkg + "/" if pkg else "") + root_dir
+    runner = ctx.actions.declare_file(name)
+    ctx.actions.write(
+        output = runner,
+        is_executable = True,
+        content = """#!/usr/bin/env bash
+set -euo pipefail
+if [[ -n "${{RUNFILES_DIR:-}}" ]]; then rf="$RUNFILES_DIR"
+elif [[ -d "$0.runfiles" ]]; then rf="$0.runfiles"
+else rf="${{BASH_SOURCE[0]}}.runfiles"; fi
+ws="{ws}"
+exec env LEAN_PATH="$rf/$ws/{root}" "$rf/{lean}" --run "$rf/$ws/{entry}" "$@"
+""".format(ws = ctx.workspace_name, root = root_rf, lean = lean_rf, entry = entry_src.short_path),
+    )
+
+    runfiles = ctx.runfiles(
+        files = own_oleans + [marker, entry_src, tc.lean],
+        transitive_files = depset(transitive = [tc.runtime, dep_files]),
+    )
+    return [DefaultInfo(executable = runner, runfiles = runfiles)]
+
+lean_binary = rule(
+    implementation = _lean_binary_impl,
+    executable = True,
+    attrs = {
+        "srcs": attr.label_list(allow_files = [".lean"], mandatory = True),
+        "entry": attr.string(mandatory = True, doc = "Module-path of the src whose `main` is the entry point."),
+        "deps": attr.label_list(providers = [LeanInfo]),
+        "_driver": attr.label(
+            default = "@rules_lean//lean/private:topo_compile.lean",
+            allow_single_file = True,
+        ),
+    },
+    toolchains = ["@rules_lean//lean:toolchain_type"],
+    doc = "A runnable Lean executable: compiles srcs to an olean root and `lean --run`s the entry with runtime argv.",
+)
+
+# =============================================================================
 # lean_olean_archive: tar a lean_library's OWN .olean import-root tree into a
 # deployable artifact. The tarball unpacks to an import root (`Foo/Bar.olean`,
 # `.lean_root` at top) consumable by `lean_imported_library`. One archive per
