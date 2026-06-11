@@ -751,11 +751,14 @@ def _lean_olean_archive_impl(ctx):
     out = ctx.actions.declare_file(ctx.attr.out if ctx.attr.out else (ctx.label.name + ".tar.gz"))
 
     # `tar -C <root> .` packs the import-root contents at the tarball top.
-    # Portable across GNU and bsd tar (macOS); entries are gzip-compressed.
+    # -h dereferences: in the build action the import-root is a symlink farm into
+    # bazel-out, so without -h the archive would hold dangling links to build-time
+    # paths instead of the real .olean bytes. Portable across GNU and bsd tar
+    # (macOS); entries are gzip-compressed.
     ctx.actions.run_shell(
         outputs = [out],
         inputs = depset(own_files),
-        command = 'tar -czf "{out}" -C "{root}" .'.format(out = out.path, root = root),
+        command = 'tar -czhf "{out}" -C "{root}" .'.format(out = out.path, root = root),
         mnemonic = "LeanOleanArchive",
         progress_message = "Lean olean archive %s" % ctx.label.name,
     )
